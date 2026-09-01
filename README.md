@@ -12,30 +12,33 @@ A lightweight, high-performance Redis-like in-memory cache library for Java. Zer
 
 ## Installation
 
-### Option 1: Local Maven Install
+### Maven Central
 
-```bash
-mvn install:install-file \
-  -Dfile=target/redis-cache-1.0.0.jar \
-  -DgroupId=com.cache \
-  -DartifactId=redis-cache \
-  -Dversion=1.0.0 \
-  -Dpackaging=jar
-```
-
-Then add to your `pom.xml`:
+Add the dependency to your `pom.xml`:
 
 ```xml
 <dependency>
-    <groupId>com.cache</groupId>
+    <groupId>io.github.chandab0</groupId>
     <artifactId>redis-cache</artifactId>
     <version>1.0.0</version>
 </dependency>
 ```
 
-### Option 2: Add JAR Directly
+Or with Gradle:
 
-Add `target/redis-cache-1.0.0.jar` to your project's classpath.
+```groovy
+implementation 'io.github.chandab0:redis-cache:1.0.0'
+```
+
+Or with Gradle Kotlin DSL:
+
+```kotlin
+implementation("io.github.chandab0:redis-cache:1.0.0")
+```
+
+### Manual Installation
+
+Download the JAR from [Maven Central](https://central.sonatype.com/artifact/io.github.chandab0/redis-cache) and add it to your project's classpath.
 
 ## Quick Start
 
