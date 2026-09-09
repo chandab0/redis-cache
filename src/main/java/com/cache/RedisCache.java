@@ -1,77 +1,229 @@
 package com.cache;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 
 /**
- * Redis-like in-memory cache with support for multiple data structures.
+ * Redis-like in-memory cache with support for multiple data structures,
+ * universal TTL across all types, true thread-safety, real blocking queues,
+ * and configurable eviction policies.
  *
  * <p>Supported data types:
  * <ul>
  *   <li>Strings - simple key-value pairs with optional TTL</li>
- *   <li>Lists - ordered collections with push/pop operations</li>
- *   <li>Sets - unordered unique collections</li>
- *   <li>Sorted Sets - ordered unique collections with scores</li>
+ *   <li>Lists - ordered collections with push/pop and blocking operations</li>
+ *   <li>Sets - unordered unique collections with set algebra</li>
+ *   <li>Sorted Sets - ordered collections scored by double values</li>
  *   <li>Hashes - field-value maps</li>
  * </ul>
  *
- * <p>Usage example:
- * <pre>
- * RedisCache cache = new RedisCache();
- *
- * // String operations
- * cache.set("user:1", "John");
- * cache.set("session:abc", token, 3600000); // 1 hour TTL
- * String name = cache.get("user:1");
- *
- * // List operations
- * cache.lpush("queue", "task1", "task2");
- * String task = cache.rpop("queue");
- *
- * // Set operations
- * cache.sadd("tags", "java", "cache", "redis");
- * boolean isMember = cache.sismember("tags", "java");
- *
- * // Hash operations
- * cache.hset("user:1:profile", "name", "John");
- * cache.hset("user:1:profile", "age", "30");
- * String name = cache.hget("user:1:profile", "name");
- *
- * // Sorted Set operations
- * cache.zadd("leaderboard", 100, "player1");
- * cache.zadd("leaderboard", 200, "player2");
- * Set<String> top = cache.zrange("leaderboard", 0, 9);
- *
- * cache.shutdown();
- * </pre>
- *
- * @author Redis-Cache
- * @version 1.0.0
+ * @author Biswajit Chanda
+ * @version 1.0.2
  */
 public class RedisCache {
     private final CacheStore stringStore;
     private final ConcurrentHashMap<String, LinkedList<Object>> lists;
     private final ConcurrentHashMap<String, Set<Object>> sets;
     private final ConcurrentHashMap<String, Map<String, Object>> hashes;
-    private final ConcurrentHashMap<String, TreeMap<Double, Set<String>>> sortedSets;
-    private final ConcurrentHashMap<String, Map<String, Double>> sortedSetScores;
+    private final ConcurrentHashMap<String, SortedSetContainer> sortedSets;
 
-    private final long defaultCleanupInterval;
+    private final ConcurrentHashMap<String, Long> keyExpirations;
+    private final ConcurrentHashMap<String, Long> lastAccessTimes;
+    private final ConcurrentHashMap<String, Long> creationTimes;
+    private final Set<String> allKeys;
+    private final ConcurrentHashMap<String, Object> listLocks;
 
+    private final ScheduledExecutorService cleanupExecutor;
+    private final int maxCapacity;
+    private final EvictionPolicy evictionPolicy;
+    private final AtomicLong evictedCount;
+    private final AtomicLong expiredCount;
+    private volatile boolean running = true;
+
+    /**
+     * Creates an unbounded cache with default cleanup interval of 1 second and NO_EVICTION.
+     */
     public RedisCache() {
-        this(1000);
+        this(1000, 0, EvictionPolicy.NO_EVICTION);
     }
 
+    /**
+     * Creates an unbounded cache with specified cleanup interval.
+     *
+     * @param cleanupIntervalMillis interval in ms for cleaning expired keys
+     */
     public RedisCache(long cleanupIntervalMillis) {
-        this.defaultCleanupInterval = cleanupIntervalMillis;
+        this(cleanupIntervalMillis, 0, EvictionPolicy.NO_EVICTION);
+    }
+
+    /**
+     * Creates a bounded cache with specified capacity and eviction policy.
+     *
+     * @param maxCapacity maximum number of keys allowed in the cache (0 for unbounded)
+     * @param evictionPolicy policy to use when cache reaches max capacity
+     */
+    public RedisCache(int maxCapacity, EvictionPolicy evictionPolicy) {
+        this(1000, maxCapacity, evictionPolicy);
+    }
+
+    /**
+     * Creates a cache with specified cleanup interval, capacity, and eviction policy.
+     *
+     * @param cleanupIntervalMillis interval in ms for cleaning expired keys
+     * @param maxCapacity maximum number of keys allowed in the cache (0 for unbounded)
+     * @param evictionPolicy policy to use when cache reaches max capacity
+     */
+    public RedisCache(long cleanupIntervalMillis, int maxCapacity, EvictionPolicy evictionPolicy) {
+        this.maxCapacity = Math.max(0, maxCapacity);
+        this.evictionPolicy = evictionPolicy != null ? evictionPolicy : EvictionPolicy.NO_EVICTION;
         this.stringStore = new CacheStore(cleanupIntervalMillis);
         this.lists = new ConcurrentHashMap<>();
         this.sets = new ConcurrentHashMap<>();
         this.hashes = new ConcurrentHashMap<>();
         this.sortedSets = new ConcurrentHashMap<>();
-        this.sortedSetScores = new ConcurrentHashMap<>();
+
+        this.keyExpirations = new ConcurrentHashMap<>();
+        this.lastAccessTimes = new ConcurrentHashMap<>();
+        this.creationTimes = new ConcurrentHashMap<>();
+        this.allKeys = ConcurrentHashMap.newKeySet();
+        this.listLocks = new ConcurrentHashMap<>();
+
+        this.evictedCount = new AtomicLong(0);
+        this.expiredCount = new AtomicLong(0);
+
+        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "redis-cache-cleanup");
+            t.setDaemon(true);
+            return t;
+        });
+        this.cleanupExecutor.scheduleAtFixedRate(
+            this::cleanupExpired,
+            cleanupIntervalMillis,
+            cleanupIntervalMillis,
+            TimeUnit.MILLISECONDS
+        );
+    }
+
+    // ==================== INTERNAL HELPERS ====================
+
+    private Object getListLock(String key) {
+        return listLocks.computeIfAbsent(key, k -> new Object());
+    }
+
+    private void recordAccess(String key) {
+        lastAccessTimes.put(key, System.nanoTime());
+    }
+
+    private void recordCreation(String key) {
+        allKeys.add(key);
+        creationTimes.putIfAbsent(key, System.currentTimeMillis());
+        recordAccess(key);
+    }
+
+    private boolean checkExpired(String key) {
+        Long expireAt = keyExpirations.get(key);
+        if (expireAt != null && System.currentTimeMillis() > expireAt) {
+            delInternal(key);
+            expiredCount.incrementAndGet();
+            return true;
+        }
+        return false;
+    }
+
+    private void delInternal(String key) {
+        stringStore.delete(key);
+        lists.remove(key);
+        sets.remove(key);
+        hashes.remove(key);
+        sortedSets.remove(key);
+        keyExpirations.remove(key);
+        lastAccessTimes.remove(key);
+        creationTimes.remove(key);
+        allKeys.remove(key);
+        Object lock = listLocks.get(key);
+        if (lock != null) {
+            synchronized (lock) {
+                lock.notifyAll();
+            }
+        }
+    }
+
+    private synchronized void ensureCapacity(String key) {
+        if (maxCapacity <= 0 || allKeys.contains(key)) {
+            return;
+        }
+
+        if (evictionPolicy == EvictionPolicy.NO_EVICTION) {
+            if (allKeys.size() >= maxCapacity) {
+                throw new IllegalStateException("OOM: cache is full (maxCapacity=" + maxCapacity + ") with NO_EVICTION policy");
+            }
+            return;
+        }
+
+        while (allKeys.size() >= maxCapacity && !allKeys.isEmpty()) {
+            String victim = selectEvictionCandidate();
+            if (victim == null) {
+                break;
+            }
+            delInternal(victim);
+            evictedCount.incrementAndGet();
+        }
+
+        if (allKeys.size() >= maxCapacity) {
+            throw new IllegalStateException("OOM: unable to evict any keys under policy " + evictionPolicy);
+        }
+    }
+
+    private String selectEvictionCandidate() {
+        switch (evictionPolicy) {
+            case ALLKEYS_LRU:
+                return findMinKey(allKeys, lastAccessTimes);
+            case VOLATILE_LRU:
+                return findMinKey(keyExpirations.keySet(), lastAccessTimes);
+            case VOLATILE_TTL:
+                return findMinKey(keyExpirations.keySet(), keyExpirations);
+            case ALLKEYS_FIFO:
+                return findMinKey(allKeys, creationTimes);
+            default:
+                return null;
+        }
+    }
+
+    private String findMinKey(Collection<String> pool, Map<String, ? extends Number> metricMap) {
+        if (pool.isEmpty()) return null;
+        String bestKey = null;
+        double minVal = Double.MAX_VALUE;
+
+        Iterable<String> candidates;
+        if (pool.size() <= 200) {
+            candidates = pool;
+        } else {
+            List<String> sampleList = new ArrayList<>(pool);
+            Collections.shuffle(sampleList);
+            candidates = sampleList.subList(0, Math.min(10, sampleList.size()));
+        }
+
+        for (String k : candidates) {
+            Number val = metricMap.get(k);
+            if (val != null && val.doubleValue() < minVal) {
+                minVal = val.doubleValue();
+                bestKey = k;
+            }
+        }
+        return bestKey != null ? bestKey : (pool.isEmpty() ? null : pool.iterator().next());
+    }
+
+    private void cleanupExpired() {
+        long now = System.currentTimeMillis();
+        for (Map.Entry<String, Long> entry : keyExpirations.entrySet()) {
+            if (entry.getValue() > 0 && now > entry.getValue()) {
+                delInternal(entry.getKey());
+                expiredCount.incrementAndGet();
+            }
+        }
     }
 
     // ==================== STRING OPERATIONS ====================
@@ -80,14 +232,26 @@ public class RedisCache {
      * Sets a string value.
      */
     public void set(String key, Object value) {
+        checkExpired(key);
+        ensureCapacity(key);
         stringStore.put(key, value);
+        keyExpirations.remove(key);
+        recordCreation(key);
     }
 
     /**
      * Sets a string value with TTL in milliseconds.
      */
     public void set(String key, Object value, long ttlMillis) {
+        checkExpired(key);
+        ensureCapacity(key);
         stringStore.put(key, value, ttlMillis);
+        if (ttlMillis > 0) {
+            keyExpirations.put(key, System.currentTimeMillis() + ttlMillis);
+        } else {
+            keyExpirations.remove(key);
+        }
+        recordCreation(key);
     }
 
     /**
@@ -95,14 +259,32 @@ public class RedisCache {
      * @return true if set, false if key exists
      */
     public boolean setnx(String key, Object value) {
-        return stringStore.setIfAbsent(key, value);
+        checkExpired(key);
+        if (exists(key)) return false;
+        ensureCapacity(key);
+        boolean result = stringStore.setIfAbsent(key, value);
+        if (result) {
+            keyExpirations.remove(key);
+            recordCreation(key);
+        }
+        return result;
     }
 
     /**
      * Sets a value only if key doesn't exist, with TTL.
      */
     public boolean setnx(String key, Object value, long ttlMillis) {
-        return stringStore.setIfAbsent(key, value, ttlMillis);
+        checkExpired(key);
+        if (exists(key)) return false;
+        ensureCapacity(key);
+        boolean result = stringStore.setIfAbsent(key, value, ttlMillis);
+        if (result) {
+            if (ttlMillis > 0) {
+                keyExpirations.put(key, System.currentTimeMillis() + ttlMillis);
+            }
+            recordCreation(key);
+        }
+        return result;
     }
 
     /**
@@ -110,7 +292,13 @@ public class RedisCache {
      * @return true if set, false if key doesn't exist
      */
     public boolean setxx(String key, Object value) {
-        return stringStore.setIfExists(key, value);
+        checkExpired(key);
+        if (!exists(key)) return false;
+        boolean result = stringStore.setIfExists(key, value);
+        if (result) {
+            recordAccess(key);
+        }
+        return result;
     }
 
     /**
@@ -118,7 +306,12 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T get(String key) {
-        return stringStore.get(key);
+        if (checkExpired(key)) return null;
+        T value = stringStore.get(key);
+        if (value != null) {
+            recordAccess(key);
+        }
+        return value;
     }
 
     /**
@@ -126,7 +319,7 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T get(String key, T defaultValue) {
-        T value = stringStore.get(key);
+        T value = get(key);
         return value != null ? value : defaultValue;
     }
 
@@ -134,23 +327,37 @@ public class RedisCache {
      * Gets a value or computes it if missing.
      */
     public <T> T getOrCompute(String key, Function<String, T> loader) {
-        return stringStore.getOrCompute(key, loader);
+        return getOrCompute(key, loader, 0);
     }
 
     /**
      * Gets a value or computes it if missing, with TTL.
      */
+    @SuppressWarnings("unchecked")
     public <T> T getOrCompute(String key, Function<String, T> loader, long ttlMillis) {
-        return stringStore.getOrCompute(key, loader, ttlMillis);
+        T value = get(key);
+        if (value != null) {
+            return value;
+        }
+        ensureCapacity(key);
+        value = loader.apply(key);
+        if (value != null) {
+            if (ttlMillis > 0) {
+                set(key, value, ttlMillis);
+            } else {
+                set(key, value);
+            }
+        }
+        return value;
     }
 
     /**
      * Gets the value and deletes the key (GETDEL).
      */
     public <T> T getDel(String key) {
-        T value = stringStore.get(key);
+        T value = get(key);
         if (value != null) {
-            stringStore.delete(key);
+            del(key);
         }
         return value;
     }
@@ -160,8 +367,8 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T getSet(String key, Object newValue) {
-        T oldValue = stringStore.get(key);
-        stringStore.put(key, newValue);
+        T oldValue = get(key);
+        set(key, newValue);
         return oldValue;
     }
 
@@ -169,7 +376,7 @@ public class RedisCache {
      * Sets multiple keys at once (MSET).
      */
     public void mset(Map<String, Object> keyValueMap) {
-        keyValueMap.forEach(stringStore::put);
+        keyValueMap.forEach(this::set);
     }
 
     /**
@@ -179,7 +386,7 @@ public class RedisCache {
     public <T> List<T> mget(String... keys) {
         List<T> result = new ArrayList<>();
         for (String key : keys) {
-            result.add((T) stringStore.get(key));
+            result.add(get(key));
         }
         return result;
     }
@@ -188,28 +395,32 @@ public class RedisCache {
      * Increments a numeric value by 1.
      */
     public long incr(String key) {
-        return stringStore.increment(key);
+        return incrBy(key, 1);
     }
 
     /**
      * Increments a numeric value by delta.
      */
     public long incrBy(String key, long delta) {
-        return stringStore.increment(key, delta);
+        checkExpired(key);
+        ensureCapacity(key);
+        long result = stringStore.increment(key, delta);
+        recordCreation(key);
+        return result;
     }
 
     /**
      * Decrements a numeric value by 1.
      */
     public long decr(String key) {
-        return stringStore.decrement(key);
+        return incrBy(key, -1);
     }
 
     /**
      * Decrements a numeric value by delta.
      */
     public long decrBy(String key, long delta) {
-        return stringStore.decrement(key, delta);
+        return incrBy(key, -delta);
     }
 
     /**
@@ -217,9 +428,11 @@ public class RedisCache {
      * @return new length of the string
      */
     public long append(String key, String value) {
-        String existing = stringStore.get(key);
+        checkExpired(key);
+        ensureCapacity(key);
+        String existing = get(key);
         String newValue = existing != null ? existing + value : value;
-        stringStore.put(key, newValue);
+        set(key, newValue);
         return newValue.length();
     }
 
@@ -227,7 +440,7 @@ public class RedisCache {
      * Gets substring of a string value.
      */
     public String getRange(String key, int start, int end) {
-        String value = stringStore.get(key);
+        String value = get(key);
         if (value == null) {
             return "";
         }
@@ -244,24 +457,34 @@ public class RedisCache {
      * Returns length of string value.
      */
     public long strlen(String key) {
-        String value = stringStore.get(key);
+        String value = get(key);
         return value != null ? value.length() : 0;
     }
 
-    // ==================== KEY OPERATIONS ====================
+    // ==================== KEY OPERATIONS (UNIVERSAL) ====================
 
     /**
      * Deletes one or more keys.
      * @return number of keys deleted
      */
     public long del(String... keys) {
-        return stringStore.delete(keys);
+        long count = 0;
+        for (String key : keys) {
+            if (exists(key)) {
+                delInternal(key);
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
      * Checks if key exists.
      */
     public boolean exists(String key) {
+        if (checkExpired(key)) {
+            return false;
+        }
         return stringStore.exists(key) ||
                lists.containsKey(key) ||
                sets.containsKey(key) ||
@@ -270,14 +493,21 @@ public class RedisCache {
     }
 
     /**
-     * Sets TTL on a key in milliseconds.
+     * Sets TTL on any key in milliseconds.
      */
     public boolean pexpire(String key, long milliseconds) {
-        return stringStore.expire(key, milliseconds);
+        if (checkExpired(key)) return false;
+        if (!exists(key)) return false;
+        long expireAt = System.currentTimeMillis() + milliseconds;
+        keyExpirations.put(key, expireAt);
+        if (stringStore.exists(key)) {
+            stringStore.expire(key, milliseconds);
+        }
+        return true;
     }
 
     /**
-     * Sets TTL on a key in seconds.
+     * Sets TTL on any key in seconds.
      */
     public boolean expire(String key, long seconds) {
         return pexpire(key, seconds * 1000);
@@ -287,7 +517,12 @@ public class RedisCache {
      * Gets remaining TTL in milliseconds.
      */
     public long pttl(String key) {
-        return stringStore.getTtl(key);
+        if (checkExpired(key)) return -2;
+        if (!exists(key)) return -2;
+        Long expireAt = keyExpirations.get(key);
+        if (expireAt == null) return -1;
+        long remaining = expireAt - System.currentTimeMillis();
+        return remaining <= 0 ? -2 : remaining;
     }
 
     /**
@@ -295,30 +530,40 @@ public class RedisCache {
      */
     public long ttl(String key) {
         long ms = pttl(key);
-        return ms < 0 ? ms : ms / 1000;
+        if (ms <= 0) return ms;
+        return (ms + 999) / 1000;
     }
 
     /**
-     * Removes TTL from a key.
+     * Removes TTL from any key.
      */
     public boolean persist(String key) {
-        return stringStore.persist(key);
+        if (checkExpired(key)) return false;
+        if (!exists(key)) return false;
+        boolean removed = keyExpirations.remove(key) != null;
+        stringStore.persist(key);
+        return removed;
     }
 
     /**
      * Finds all keys matching pattern.
      */
     public Set<String> keys(String pattern) {
-        Set<String> allKeys = new HashSet<>();
-        allKeys.addAll(stringStore.keys(pattern));
+        Set<String> activeKeys = new HashSet<>();
+        for (String key : allKeys) {
+            if (!checkExpired(key)) {
+                activeKeys.add(key);
+            }
+        }
 
         String regex = patternToRegex(pattern);
-        lists.keySet().stream().filter(k -> k.matches(regex)).forEach(allKeys::add);
-        sets.keySet().stream().filter(k -> k.matches(regex)).forEach(allKeys::add);
-        hashes.keySet().stream().filter(k -> k.matches(regex)).forEach(allKeys::add);
-        sortedSets.keySet().stream().filter(k -> k.matches(regex)).forEach(allKeys::add);
-
-        return allKeys;
+        Set<String> matched = new HashSet<>();
+        for (String key : activeKeys) {
+            if (key.matches(regex)) {
+                matched.add(key);
+            }
+        }
+        return matched;
     }
 
     /**
@@ -332,17 +577,28 @@ public class RedisCache {
      * Renames a key.
      */
     public void rename(String oldKey, String newKey) {
+        if (checkExpired(oldKey)) return;
+        checkExpired(newKey);
+
+        Long oldTtl = keyExpirations.get(oldKey);
+
         // String store
-        Object value = stringStore.get(oldKey);
-        if (value != null) {
-            stringStore.put(newKey, value);
+        Object strValue = stringStore.get(oldKey);
+        if (strValue != null) {
+            stringStore.put(newKey, strValue);
             stringStore.delete(oldKey);
         }
 
         // Lists
-        LinkedList<Object> list = lists.remove(oldKey);
-        if (list != null) {
-            lists.put(newKey, list);
+        Object oldLock = getListLock(oldKey);
+        Object newLock = getListLock(newKey);
+        synchronized (oldLock) {
+            synchronized (newLock) {
+                LinkedList<Object> list = lists.remove(oldKey);
+                if (list != null) {
+                    lists.put(newKey, list);
+                }
+            }
         }
 
         // Sets
@@ -358,12 +614,20 @@ public class RedisCache {
         }
 
         // Sorted Sets
-        TreeMap<Double, Set<String>> sortedSet = sortedSets.remove(oldKey);
-        Map<String, Double> scores = sortedSetScores.remove(oldKey);
-        if (sortedSet != null) {
-            sortedSets.put(newKey, sortedSet);
-            sortedSetScores.put(newKey, scores);
+        SortedSetContainer zset = sortedSets.remove(oldKey);
+        if (zset != null) {
+            sortedSets.put(newKey, zset);
         }
+
+        keyExpirations.remove(oldKey);
+        lastAccessTimes.remove(oldKey);
+        creationTimes.remove(oldKey);
+        allKeys.remove(oldKey);
+
+        if (oldTtl != null) {
+            keyExpirations.put(newKey, oldTtl);
+        }
+        recordCreation(newKey);
     }
 
     private String patternToRegex(String pattern) {
@@ -383,18 +647,25 @@ public class RedisCache {
         return regex.toString();
     }
 
-    // ==================== LIST OPERATIONS ====================
+    // ==================== LIST OPERATIONS (THREAD-SAFE & BLOCKING) ====================
 
     /**
      * Pushes elements to the left of a list (LPUSH).
      * @return length of list after push
      */
     public long lpush(String key, Object... values) {
-        LinkedList<Object> list = lists.computeIfAbsent(key, k -> new LinkedList<>());
-        for (Object value : values) {
-            list.addFirst(value);
+        checkExpired(key);
+        ensureCapacity(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.computeIfAbsent(key, k -> new LinkedList<>());
+            for (Object value : values) {
+                list.addFirst(value);
+            }
+            recordCreation(key);
+            lock.notifyAll();
+            return list.size();
         }
-        return list.size();
     }
 
     /**
@@ -402,31 +673,50 @@ public class RedisCache {
      * @return length of list after push
      */
     public long rpush(String key, Object... values) {
-        LinkedList<Object> list = lists.computeIfAbsent(key, k -> new LinkedList<>());
-        for (Object value : values) {
-            list.addLast(value);
+        checkExpired(key);
+        ensureCapacity(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.computeIfAbsent(key, k -> new LinkedList<>());
+            for (Object value : values) {
+                list.addLast(value);
+            }
+            recordCreation(key);
+            lock.notifyAll();
+            return list.size();
         }
-        return list.size();
     }
 
     /**
      * Pushes to left only if list exists (LPUSHX).
      */
     public long lpushx(String key, Object value) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null) return 0;
-        list.addFirst(value);
-        return list.size();
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return 0;
+            list.addFirst(value);
+            recordAccess(key);
+            lock.notifyAll();
+            return list.size();
+        }
     }
 
     /**
      * Pushes to right only if list exists (RPUSHX).
      */
     public long rpushx(String key, Object value) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null) return 0;
-        list.addLast(value);
-        return list.size();
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return 0;
+            list.addLast(value);
+            recordAccess(key);
+            lock.notifyAll();
+            return list.size();
+        }
     }
 
     /**
@@ -434,11 +724,18 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T lpop(String key) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null || list.isEmpty()) return null;
-        T value = (T) list.removeFirst();
-        if (list.isEmpty()) lists.remove(key);
-        return value;
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null || list.isEmpty()) return null;
+            recordAccess(key);
+            T value = (T) list.removeFirst();
+            if (list.isEmpty()) {
+                delInternal(key);
+            }
+            return value;
+        }
     }
 
     /**
@@ -446,11 +743,18 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T rpop(String key) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null || list.isEmpty()) return null;
-        T value = (T) list.removeLast();
-        if (list.isEmpty()) lists.remove(key);
-        return value;
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null || list.isEmpty()) return null;
+            recordAccess(key);
+            T value = (T) list.removeLast();
+            if (list.isEmpty()) {
+                delInternal(key);
+            }
+            return value;
+        }
     }
 
     /**
@@ -458,19 +762,30 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T lindex(String key, long index) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null) return null;
-        if (index < 0) index = list.size() + index;
-        if (index < 0 || index >= list.size()) return null;
-        return (T) list.get((int) index);
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return null;
+            recordAccess(key);
+            if (index < 0) index = list.size() + index;
+            if (index < 0 || index >= list.size()) return null;
+            return (T) list.get((int) index);
+        }
     }
 
     /**
      * Returns length of list (LLEN).
      */
     public long llen(String key) {
-        LinkedList<Object> list = lists.get(key);
-        return list != null ? list.size() : 0;
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return 0;
+            recordAccess(key);
+            return list.size();
+        }
     }
 
     /**
@@ -478,144 +793,216 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> List<T> lrange(String key, long start, long stop) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null) return Collections.emptyList();
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return Collections.emptyList();
+            recordAccess(key);
 
-        int size = list.size();
-        if (start < 0) start = Math.max(0, size + start);
-        if (stop < 0) stop = size + stop;
-        if (start > stop || start >= size) return Collections.emptyList();
+            int size = list.size();
+            if (start < 0) start = Math.max(0, size + start);
+            if (stop < 0) stop = size + stop;
+            if (start > stop || start >= size) return Collections.emptyList();
 
-        stop = Math.min(stop, size - 1);
-        List<T> result = new ArrayList<>();
-        for (int i = (int) start; i <= stop; i++) {
-            result.add((T) list.get(i));
+            stop = Math.min(stop, size - 1);
+            List<T> result = new ArrayList<>();
+            for (int i = (int) start; i <= stop; i++) {
+                result.add((T) list.get(i));
+            }
+            return result;
         }
-        return result;
     }
 
     /**
      * Trims list to specified range (LTRIM).
      */
     public void ltrim(String key, long start, long stop) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null) return;
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return;
+            recordAccess(key);
 
-        int size = list.size();
-        if (start < 0) start = Math.max(0, size + start);
-        if (stop < 0) stop = size + stop;
-        if (start > stop) {
-            lists.remove(key);
-            return;
-        }
+            int size = list.size();
+            if (start < 0) start = Math.max(0, size + start);
+            if (stop < 0) stop = size + stop;
+            if (start > stop) {
+                delInternal(key);
+                return;
+            }
 
-        stop = Math.min(stop, size - 1);
-        LinkedList<Object> newList = new LinkedList<>();
-        for (int i = (int) start; i <= stop; i++) {
-            newList.add(list.get(i));
+            stop = Math.min(stop, size - 1);
+            LinkedList<Object> newList = new LinkedList<>();
+            for (int i = (int) start; i <= stop; i++) {
+                newList.add(list.get(i));
+            }
+            lists.put(key, newList);
         }
-        lists.put(key, newList);
     }
 
     /**
      * Sets element at index (LSET).
      */
     public boolean lset(String key, long index, Object value) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null) return false;
-        if (index < 0) index = list.size() + index;
-        if (index < 0 || index >= list.size()) return false;
-        list.set((int) index, value);
-        return true;
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return false;
+            if (index < 0) index = list.size() + index;
+            if (index < 0 || index >= list.size()) return false;
+            list.set((int) index, value);
+            recordAccess(key);
+            return true;
+        }
     }
 
     /**
      * Removes elements matching value (LREM).
-     * @param count positive: remove from head; negative: from tail; zero: all
-     * @return number of elements removed
      */
     public long lrem(String key, long count, Object value) {
-        LinkedList<Object> list = lists.get(key);
-        if (list == null) return 0;
+        checkExpired(key);
+        Object lock = getListLock(key);
+        synchronized (lock) {
+            LinkedList<Object> list = lists.get(key);
+            if (list == null) return 0;
+            recordAccess(key);
 
-        long removed = 0;
-        if (count == 0) {
-            removed = list.stream().filter(v -> Objects.equals(v, value)).count();
-            list.removeIf(v -> Objects.equals(v, value));
-        } else if (count > 0) {
-            Iterator<Object> iter = list.iterator();
-            while (iter.hasNext() && removed < count) {
-                if (Objects.equals(iter.next(), value)) {
-                    iter.remove();
-                    removed++;
+            long removed = 0;
+            if (count == 0) {
+                removed = list.stream().filter(v -> Objects.equals(v, value)).count();
+                list.removeIf(v -> Objects.equals(v, value));
+            } else if (count > 0) {
+                Iterator<Object> iter = list.iterator();
+                while (iter.hasNext() && removed < count) {
+                    if (Objects.equals(iter.next(), value)) {
+                        iter.remove();
+                        removed++;
+                    }
+                }
+            } else {
+                Iterator<Object> iter = list.descendingIterator();
+                while (iter.hasNext() && removed < -count) {
+                    if (Objects.equals(iter.next(), value)) {
+                        iter.remove();
+                        removed++;
+                    }
                 }
             }
-        } else {
-            Iterator<Object> iter = list.descendingIterator();
-            while (iter.hasNext() && removed < -count) {
-                if (Objects.equals(iter.next(), value)) {
-                    iter.remove();
-                    removed++;
-                }
-            }
+            if (list.isEmpty()) delInternal(key);
+            return removed;
         }
-        if (list.isEmpty()) lists.remove(key);
-        return removed;
     }
 
     /**
-     * Pops from right and pushes to left of another list (RPOPLPUSH).
+     * Pops from right of source and pushes to left of destination (RPOPLPUSH).
      */
     public <T> T rpoplpush(String source, String destination) {
-        T value = rpop(source);
-        if (value != null) {
-            lpush(destination, value);
+        checkExpired(source);
+        checkExpired(destination);
+        String first = source.compareTo(destination) <= 0 ? source : destination;
+        String second = source.compareTo(destination) <= 0 ? destination : source;
+        synchronized (getListLock(first)) {
+            synchronized (getListLock(second)) {
+                T value = rpop(source);
+                if (value != null) {
+                    lpush(destination, value);
+                }
+                return value;
+            }
         }
-        return value;
     }
 
     /**
-     * Blocks until pop from left (BLPOP) - simplified non-blocking version.
-     * Returns immediately if list is empty.
+     * Blocking pop from left of list (BLPOP).
+     * Blocks up to timeoutSeconds until an element is available.
      */
+    @SuppressWarnings("unchecked")
     public <T> T blpop(String key, long timeoutSeconds) {
-        return lpop(key);
+        Object lock = getListLock(key);
+        long deadline = timeoutSeconds > 0 ? System.currentTimeMillis() + (timeoutSeconds * 1000) : Long.MAX_VALUE;
+        synchronized (lock) {
+            while (true) {
+                checkExpired(key);
+                T val = lpop(key);
+                if (val != null) {
+                    return val;
+                }
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    return null;
+                }
+                try {
+                    lock.wait(Math.min(remaining, 1000));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
     }
 
     /**
-     * Blocks until pop from right (BRPOP) - simplified non-blocking version.
+     * Blocking pop from right of list (BRPOP).
+     * Blocks up to timeoutSeconds until an element is available.
      */
+    @SuppressWarnings("unchecked")
     public <T> T brpop(String key, long timeoutSeconds) {
-        return rpop(key);
+        Object lock = getListLock(key);
+        long deadline = timeoutSeconds > 0 ? System.currentTimeMillis() + (timeoutSeconds * 1000) : Long.MAX_VALUE;
+        synchronized (lock) {
+            while (true) {
+                checkExpired(key);
+                T val = rpop(key);
+                if (val != null) {
+                    return val;
+                }
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    return null;
+                }
+                try {
+                    lock.wait(Math.min(remaining, 1000));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
     }
 
     // ==================== SET OPERATIONS ====================
 
     /**
      * Adds members to a set (SADD).
-     * @return number of members added (not already present)
      */
     public long sadd(String key, Object... members) {
+        checkExpired(key);
+        ensureCapacity(key);
         Set<Object> set = sets.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
         long added = 0;
         for (Object member : members) {
             if (set.add(member)) added++;
         }
+        recordCreation(key);
         return added;
     }
 
     /**
      * Removes members from a set (SREM).
-     * @return number of members removed
      */
     public long srem(String key, Object... members) {
+        checkExpired(key);
         Set<Object> set = sets.get(key);
         if (set == null) return 0;
+        recordAccess(key);
         long removed = 0;
         for (Object member : members) {
             if (set.remove(member)) removed++;
         }
-        if (set.isEmpty()) sets.remove(key);
+        if (set.isEmpty()) delInternal(key);
         return removed;
     }
 
@@ -624,24 +1011,33 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> Set<T> smembers(String key) {
+        checkExpired(key);
         Set<Object> set = sets.get(key);
-        return set != null ? new HashSet<>((Set<T>) set) : Collections.emptySet();
+        if (set == null) return Collections.emptySet();
+        recordAccess(key);
+        return new HashSet<>((Set<T>) set);
     }
 
     /**
      * Checks if member exists in set (SISMEMBER).
      */
     public boolean sismember(String key, Object member) {
+        checkExpired(key);
         Set<Object> set = sets.get(key);
-        return set != null && set.contains(member);
+        if (set == null) return false;
+        recordAccess(key);
+        return set.contains(member);
     }
 
     /**
      * Returns number of members in set (SCARD).
      */
     public long scard(String key) {
+        checkExpired(key);
         Set<Object> set = sets.get(key);
-        return set != null ? set.size() : 0;
+        if (set == null) return 0;
+        recordAccess(key);
+        return set.size();
     }
 
     /**
@@ -649,12 +1045,14 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T spop(String key) {
+        checkExpired(key);
         Set<Object> set = sets.get(key);
         if (set == null || set.isEmpty()) return null;
+        recordAccess(key);
         Iterator<Object> iter = set.iterator();
         T value = (T) iter.next();
         iter.remove();
-        if (set.isEmpty()) sets.remove(key);
+        if (set.isEmpty()) delInternal(key);
         return value;
     }
 
@@ -663,8 +1061,10 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T srandmember(String key) {
+        checkExpired(key);
         Set<Object> set = sets.get(key);
         if (set == null || set.isEmpty()) return null;
+        recordAccess(key);
         return (T) set.iterator().next();
     }
 
@@ -672,10 +1072,12 @@ public class RedisCache {
      * Moves member from one set to another (SMOVE).
      */
     public boolean smove(String source, String destination, Object member) {
+        checkExpired(source);
+        checkExpired(destination);
         Set<Object> srcSet = sets.get(source);
         if (srcSet == null || !srcSet.contains(member)) return false;
         srcSet.remove(member);
-        if (srcSet.isEmpty()) sets.remove(source);
+        if (srcSet.isEmpty()) delInternal(source);
         sadd(destination, member);
         return true;
     }
@@ -725,16 +1127,23 @@ public class RedisCache {
      * @return 1 if new field, 0 if updated
      */
     public long hset(String key, String field, Object value) {
+        checkExpired(key);
+        ensureCapacity(key);
         Map<String, Object> hash = hashes.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
-        return hash.put(field, value) == null ? 1 : 0;
+        long result = hash.put(field, value) == null ? 1 : 0;
+        recordCreation(key);
+        return result;
     }
 
     /**
      * Sets multiple fields in hash (HMSET).
      */
     public void hmset(String key, Map<String, Object> fieldValueMap) {
+        checkExpired(key);
+        ensureCapacity(key);
         Map<String, Object> hash = hashes.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
         hash.putAll(fieldValueMap);
+        recordCreation(key);
     }
 
     /**
@@ -742,8 +1151,10 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> T hget(String key, String field) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
         if (hash == null) return null;
+        recordAccess(key);
         return (T) hash.get(field);
     }
 
@@ -752,12 +1163,14 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> List<T> hmget(String key, String... fields) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
         List<T> result = new ArrayList<>();
         if (hash == null) {
             for (int i = 0; i < fields.length; i++) result.add(null);
             return result;
         }
+        recordAccess(key);
         for (String field : fields) {
             result.add((T) hash.get(field));
         }
@@ -769,8 +1182,11 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> Map<String, T> hgetall(String key) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
-        return hash != null ? new HashMap<>((Map<String, T>) hash) : Collections.emptyMap();
+        if (hash == null) return Collections.emptyMap();
+        recordAccess(key);
+        return new HashMap<>((Map<String, T>) hash);
     }
 
     /**
@@ -778,13 +1194,15 @@ public class RedisCache {
      * @return number of fields removed
      */
     public long hdel(String key, String... fields) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
         if (hash == null) return 0;
+        recordAccess(key);
         long removed = 0;
         for (String field : fields) {
             if (hash.remove(field) != null) removed++;
         }
-        if (hash.isEmpty()) hashes.remove(key);
+        if (hash.isEmpty()) delInternal(key);
         return removed;
     }
 
@@ -792,16 +1210,22 @@ public class RedisCache {
      * Checks if field exists in hash (HEXISTS).
      */
     public boolean hexists(String key, String field) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
-        return hash != null && hash.containsKey(field);
+        if (hash == null) return false;
+        recordAccess(key);
+        return hash.containsKey(field);
     }
 
     /**
      * Returns all fields in hash (HKEYS).
      */
     public Set<String> hkeys(String key) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
-        return hash != null ? new HashSet<>(hash.keySet()) : Collections.emptySet();
+        if (hash == null) return Collections.emptySet();
+        recordAccess(key);
+        return new HashSet<>(hash.keySet());
     }
 
     /**
@@ -809,87 +1233,91 @@ public class RedisCache {
      */
     @SuppressWarnings("unchecked")
     public <T> List<T> hvals(String key) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
-        return hash != null ? new ArrayList<>((Collection<T>) hash.values()) : Collections.emptyList();
+        if (hash == null) return Collections.emptyList();
+        recordAccess(key);
+        return new ArrayList<>((Collection<T>) hash.values());
     }
 
     /**
      * Returns number of fields in hash (HLEN).
      */
     public long hlen(String key) {
+        checkExpired(key);
         Map<String, Object> hash = hashes.get(key);
-        return hash != null ? hash.size() : 0;
+        if (hash == null) return 0;
+        recordAccess(key);
+        return hash.size();
     }
 
     /**
-     * Increments hash field by value (HINCRBY).
+     * Increments hash field by value (HINCRBY) atomically.
      */
     public long hincrBy(String key, String field, long increment) {
+        checkExpired(key);
+        ensureCapacity(key);
         Map<String, Object> hash = hashes.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
-        Object value = hash.get(field);
-        long current = 0;
-        if (value instanceof Number) {
-            current = ((Number) value).longValue();
-        } else if (value instanceof String) {
-            current = Long.parseLong((String) value);
-        }
-        long newValue = current + increment;
-        hash.put(field, newValue);
-        return newValue;
+        Object result = hash.compute(field, (f, oldVal) -> {
+            long current = 0;
+            if (oldVal instanceof Number) {
+                current = ((Number) oldVal).longValue();
+            } else if (oldVal instanceof String) {
+                current = Long.parseLong((String) oldVal);
+            }
+            return current + increment;
+        });
+        recordCreation(key);
+        return ((Number) result).longValue();
     }
 
     /**
-     * Increments hash field by float (HINCRBYFLOAT).
+     * Increments hash field by float (HINCRBYFLOAT) atomically.
      */
     public double hincrByFloat(String key, String field, double increment) {
+        checkExpired(key);
+        ensureCapacity(key);
         Map<String, Object> hash = hashes.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
-        Object value = hash.get(field);
-        double current = 0;
-        if (value instanceof Number) {
-            current = ((Number) value).doubleValue();
-        } else if (value instanceof String) {
-            current = Double.parseDouble((String) value);
-        }
-        double newValue = current + increment;
-        hash.put(field, newValue);
-        return newValue;
+        Object result = hash.compute(field, (f, oldVal) -> {
+            double current = 0.0;
+            if (oldVal instanceof Number) {
+                current = ((Number) oldVal).doubleValue();
+            } else if (oldVal instanceof String) {
+                current = Double.parseDouble((String) oldVal);
+            }
+            return current + increment;
+        });
+        recordCreation(key);
+        return ((Number) result).doubleValue();
     }
 
     /**
      * Sets field only if it doesn't exist (HSETNX).
      */
     public boolean hsetnx(String key, String field, Object value) {
+        checkExpired(key);
+        ensureCapacity(key);
         Map<String, Object> hash = hashes.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
-        if (hash.containsKey(field)) return false;
-        hash.put(field, value);
-        return true;
+        boolean set = hash.putIfAbsent(field, value) == null;
+        if (set) {
+            recordCreation(key);
+        }
+        return set;
     }
 
-    // ==================== SORTED SET OPERATIONS ====================
+    // ==================== SORTED SET OPERATIONS (THREAD-SAFE) ====================
 
     /**
      * Adds member with score to sorted set (ZADD).
      * @return 1 if new member, 0 if score updated
      */
     public long zadd(String key, double score, String member) {
-        TreeMap<Double, Set<String>> sortedSet = sortedSets.computeIfAbsent(key, k -> new TreeMap<>());
-        Map<String, Double> scores = sortedSetScores.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
-
-        Double oldScore = scores.get(member);
-        if (oldScore != null) {
-            // Remove from old score bucket
-            Set<String> bucket = sortedSet.get(oldScore);
-            if (bucket != null) {
-                bucket.remove(member);
-                if (bucket.isEmpty()) sortedSet.remove(oldScore);
-            }
-        }
-
-        // Add to new score bucket
-        sortedSet.computeIfAbsent(score, s -> ConcurrentHashMap.newKeySet()).add(member);
-        scores.put(member, score);
-
-        return oldScore == null ? 1 : 0;
+        checkExpired(key);
+        ensureCapacity(key);
+        SortedSetContainer zset = sortedSets.computeIfAbsent(key, k -> new SortedSetContainer());
+        long result = zset.add(score, member);
+        recordCreation(key);
+        return result;
     }
 
     /**
@@ -908,26 +1336,13 @@ public class RedisCache {
      * Removes member from sorted set (ZREM).
      */
     public long zrem(String key, String... members) {
-        TreeMap<Double, Set<String>> sortedSet = sortedSets.get(key);
-        Map<String, Double> scores = sortedSetScores.get(key);
-        if (sortedSet == null || scores == null) return 0;
-
-        long removed = 0;
-        for (String member : members) {
-            Double score = scores.remove(member);
-            if (score != null) {
-                Set<String> bucket = sortedSet.get(score);
-                if (bucket != null) {
-                    bucket.remove(member);
-                    if (bucket.isEmpty()) sortedSet.remove(score);
-                }
-                removed++;
-            }
-        }
-
-        if (scores.isEmpty()) {
-            sortedSets.remove(key);
-            sortedSetScores.remove(key);
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return 0;
+        recordAccess(key);
+        long removed = zset.remove(members);
+        if (zset.isEmpty()) {
+            delInternal(key);
         }
         return removed;
     }
@@ -936,131 +1351,100 @@ public class RedisCache {
      * Returns score of member (ZSCORE).
      */
     public Double zscore(String key, String member) {
-        Map<String, Double> scores = sortedSetScores.get(key);
-        return scores != null ? scores.get(member) : null;
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return null;
+        recordAccess(key);
+        return zset.score(member);
     }
 
     /**
      * Returns number of members (ZCARD).
      */
     public long zcard(String key) {
-        Map<String, Double> scores = sortedSetScores.get(key);
-        return scores != null ? scores.size() : 0;
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return 0;
+        recordAccess(key);
+        return zset.size();
     }
 
     /**
      * Increments member score (ZINCRBY).
      */
     public double zincrby(String key, double increment, String member) {
-        Double currentScore = zscore(key, member);
-        double newScore = (currentScore != null ? currentScore : 0) + increment;
-        zadd(key, newScore, member);
-        return newScore;
+        checkExpired(key);
+        ensureCapacity(key);
+        SortedSetContainer zset = sortedSets.computeIfAbsent(key, k -> new SortedSetContainer());
+        double result = zset.incrBy(increment, member);
+        recordCreation(key);
+        return result;
     }
 
     /**
      * Returns rank of member (0-based, lowest score first) (ZRANK).
      */
     public Long zrank(String key, String member) {
-        Map<String, Double> scores = sortedSetScores.get(key);
-        TreeMap<Double, Set<String>> sortedSet = sortedSets.get(key);
-        if (scores == null || sortedSet == null || !scores.containsKey(member)) return null;
-
-        double memberScore = scores.get(member);
-        long rank = 0;
-        for (Map.Entry<Double, Set<String>> entry : sortedSet.entrySet()) {
-            if (entry.getKey() < memberScore) {
-                rank += entry.getValue().size();
-            } else if (entry.getKey() == memberScore) {
-                // Count members before this one in same score bucket
-                for (String m : entry.getValue()) {
-                    if (m.equals(member)) return rank;
-                    rank++;
-                }
-            }
-        }
-        return rank;
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return null;
+        recordAccess(key);
+        return zset.rank(member);
     }
 
     /**
      * Returns rank of member (0-based, highest score first) (ZREVRANK).
      */
     public Long zrevrank(String key, String member) {
-        Long rank = zrank(key, member);
-        if (rank == null) return null;
-        return zcard(key) - 1 - rank;
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return null;
+        recordAccess(key);
+        return zset.revRank(member);
     }
 
     /**
      * Returns members in range (by rank, lowest first) (ZRANGE).
      */
     public List<String> zrange(String key, long start, long stop) {
-        TreeMap<Double, Set<String>> sortedSet = sortedSets.get(key);
-        if (sortedSet == null) return Collections.emptyList();
-
-        List<String> allMembers = new ArrayList<>();
-        for (Set<String> bucket : sortedSet.values()) {
-            allMembers.addAll(bucket);
-        }
-
-        long size = allMembers.size();
-        if (start < 0) start = Math.max(0, size + start);
-        if (stop < 0) stop = size + stop;
-        if (start > stop || start >= size) return Collections.emptyList();
-        stop = Math.min(stop, size - 1);
-
-        return allMembers.subList((int) start, (int) stop + 1);
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return Collections.emptyList();
+        recordAccess(key);
+        return zset.range(start, stop);
     }
 
     /**
      * Returns members in reverse range (highest first) (ZREVRANGE).
      */
     public List<String> zrevrange(String key, long start, long stop) {
-        TreeMap<Double, Set<String>> sortedSet = sortedSets.get(key);
-        if (sortedSet == null) return Collections.emptyList();
-
-        List<String> allMembers = new ArrayList<>();
-        for (Set<String> bucket : sortedSet.descendingMap().values()) {
-            allMembers.addAll(bucket);
-        }
-
-        long size = allMembers.size();
-        if (start < 0) start = Math.max(0, size + start);
-        if (stop < 0) stop = size + stop;
-        if (start > stop || start >= size) return Collections.emptyList();
-        stop = Math.min(stop, size - 1);
-
-        return allMembers.subList((int) start, (int) stop + 1);
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return Collections.emptyList();
+        recordAccess(key);
+        return zset.revRange(start, stop);
     }
 
     /**
      * Returns members with scores in range (ZRANGE ... WITHSCORES).
      */
     public List<Map.Entry<String, Double>> zrangeWithScores(String key, long start, long stop) {
-        List<String> members = zrange(key, start, stop);
-        List<Map.Entry<String, Double>> result = new ArrayList<>();
-        Map<String, Double> scores = sortedSetScores.get(key);
-        if (scores == null) return result;
-        for (String member : members) {
-            result.add(new AbstractMap.SimpleEntry<>(member, scores.get(member)));
-        }
-        return result;
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return Collections.emptyList();
+        recordAccess(key);
+        return zset.rangeWithScores(start, stop);
     }
 
     /**
      * Counts members with scores between min and max (ZCOUNT).
      */
     public long zcount(String key, double min, double max) {
-        TreeMap<Double, Set<String>> sortedSet = sortedSets.get(key);
-        if (sortedSet == null) return 0;
-
-        long count = 0;
-        for (Map.Entry<Double, Set<String>> entry : sortedSet.entrySet()) {
-            if (entry.getKey() >= min && entry.getKey() <= max) {
-                count += entry.getValue().size();
-            }
-        }
-        return count;
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return 0;
+        recordAccess(key);
+        return zset.count(min, max);
     }
 
     /**
@@ -1071,7 +1455,7 @@ public class RedisCache {
         return zrem(key, toRemove.toArray(new String[0]));
     }
 
-    // ==================== UTILITY METHODS ====================
+    // ==================== UTILITY & METRICS METHODS ====================
 
     /**
      * Clears all data from all data structures.
@@ -1082,7 +1466,15 @@ public class RedisCache {
         sets.clear();
         hashes.clear();
         sortedSets.clear();
-        sortedSetScores.clear();
+        keyExpirations.clear();
+        lastAccessTimes.clear();
+        creationTimes.clear();
+        allKeys.clear();
+        for (Object lock : listLocks.values()) {
+            synchronized (lock) {
+                lock.notifyAll();
+            }
+        }
     }
 
     /**
@@ -1095,9 +1487,14 @@ public class RedisCache {
         info.put("set_keys", sets.size());
         info.put("hash_keys", hashes.size());
         info.put("sorted_set_keys", sortedSets.size());
+        info.put("total_keys", allKeys.size());
         info.put("hit_count", stringStore.getHitCount());
         info.put("miss_count", stringStore.getMissCount());
         info.put("hit_ratio", stringStore.getHitRatio());
+        info.put("max_capacity", maxCapacity);
+        info.put("eviction_policy", evictionPolicy.name());
+        info.put("evicted_keys", evictedCount.get());
+        info.put("expired_keys", expiredCount.get());
         return info;
     }
 
@@ -1106,12 +1503,227 @@ public class RedisCache {
      */
     public void resetStats() {
         stringStore.resetStats();
+        evictedCount.set(0);
+        expiredCount.set(0);
+    }
+
+    public int getMaxCapacity() {
+        return maxCapacity;
+    }
+
+    public EvictionPolicy getEvictionPolicy() {
+        return evictionPolicy;
+    }
+
+    public long getEvictedCount() {
+        return evictedCount.get();
+    }
+
+    public long getExpiredCount() {
+        return expiredCount.get();
     }
 
     /**
      * Shuts down the cache and releases resources.
      */
     public void shutdown() {
+        running = false;
         stringStore.shutdown();
+        cleanupExecutor.shutdown();
+        try {
+            if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                cleanupExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            cleanupExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ==================== SORTED SET CONTAINER CLASS ====================
+
+    private static class SortedSetContainer {
+        private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+        private final TreeMap<Double, Set<String>> scoreToMembers = new TreeMap<>();
+        private final Map<String, Double> memberToScores = new HashMap<>();
+
+        int size() {
+            rwLock.readLock().lock();
+            try {
+                return memberToScores.size();
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        boolean isEmpty() {
+            return size() == 0;
+        }
+
+        long add(double score, String member) {
+            rwLock.writeLock().lock();
+            try {
+                Double oldScore = memberToScores.get(member);
+                if (oldScore != null) {
+                    if (Double.compare(oldScore, score) == 0) {
+                        return 0;
+                    }
+                    Set<String> oldBucket = scoreToMembers.get(oldScore);
+                    if (oldBucket != null) {
+                        oldBucket.remove(member);
+                        if (oldBucket.isEmpty()) {
+                            scoreToMembers.remove(oldScore);
+                        }
+                    }
+                }
+                memberToScores.put(member, score);
+                scoreToMembers.computeIfAbsent(score, s -> new LinkedHashSet<>()).add(member);
+                return oldScore == null ? 1 : 0;
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        }
+
+        long remove(String... members) {
+            rwLock.writeLock().lock();
+            try {
+                long removed = 0;
+                for (String member : members) {
+                    Double score = memberToScores.remove(member);
+                    if (score != null) {
+                        Set<String> bucket = scoreToMembers.get(score);
+                        if (bucket != null) {
+                            bucket.remove(member);
+                            if (bucket.isEmpty()) {
+                                scoreToMembers.remove(score);
+                            }
+                        }
+                        removed++;
+                    }
+                }
+                return removed;
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        }
+
+        Double score(String member) {
+            rwLock.readLock().lock();
+            try {
+                return memberToScores.get(member);
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        double incrBy(double delta, String member) {
+            rwLock.writeLock().lock();
+            try {
+                Double current = memberToScores.get(member);
+                double newScore = (current != null ? current : 0.0) + delta;
+                add(newScore, member);
+                return newScore;
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        }
+
+        Long rank(String member) {
+            rwLock.readLock().lock();
+            try {
+                Double memberScore = memberToScores.get(member);
+                if (memberScore == null) return null;
+                long rank = 0;
+                for (Map.Entry<Double, Set<String>> entry : scoreToMembers.entrySet()) {
+                    if (entry.getKey() < memberScore) {
+                        rank += entry.getValue().size();
+                    } else if (Double.compare(entry.getKey(), memberScore) == 0) {
+                        for (String m : entry.getValue()) {
+                            if (m.equals(member)) return rank;
+                            rank++;
+                        }
+                    }
+                }
+                return rank;
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        Long revRank(String member) {
+            rwLock.readLock().lock();
+            try {
+                Long r = rank(member);
+                if (r == null) return null;
+                return memberToScores.size() - 1 - r;
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        List<String> range(long start, long stop) {
+            rwLock.readLock().lock();
+            try {
+                List<String> all = new ArrayList<>();
+                for (Set<String> bucket : scoreToMembers.values()) {
+                    all.addAll(bucket);
+                }
+                long size = all.size();
+                if (start < 0) start = Math.max(0, size + start);
+                if (stop < 0) stop = size + stop;
+                if (start > stop || start >= size) return Collections.emptyList();
+                stop = Math.min(stop, size - 1);
+                return new ArrayList<>(all.subList((int) start, (int) stop + 1));
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        List<String> revRange(long start, long stop) {
+            rwLock.readLock().lock();
+            try {
+                List<String> all = new ArrayList<>();
+                for (Set<String> bucket : scoreToMembers.descendingMap().values()) {
+                    all.addAll(bucket);
+                }
+                long size = all.size();
+                if (start < 0) start = Math.max(0, size + start);
+                if (stop < 0) stop = size + stop;
+                if (start > stop || start >= size) return Collections.emptyList();
+                stop = Math.min(stop, size - 1);
+                return new ArrayList<>(all.subList((int) start, (int) stop + 1));
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        List<Map.Entry<String, Double>> rangeWithScores(long start, long stop) {
+            rwLock.readLock().lock();
+            try {
+                List<String> members = range(start, stop);
+                List<Map.Entry<String, Double>> result = new ArrayList<>();
+                for (String member : members) {
+                    result.add(new AbstractMap.SimpleEntry<>(member, memberToScores.get(member)));
+                }
+                return result;
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        long count(double min, double max) {
+            rwLock.readLock().lock();
+            try {
+                long c = 0;
+                for (Map.Entry<Double, Set<String>> entry : scoreToMembers.entrySet()) {
+                    if (entry.getKey() >= min && entry.getKey() <= max) {
+                        c += entry.getValue().size();
+                    }
+                }
+                return c;
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
     }
 }

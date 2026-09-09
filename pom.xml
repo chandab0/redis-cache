@@ -6,7 +6,7 @@
 
     <groupId>io.github.chandab0</groupId>
     <artifactId>redis-cache</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.2</version>
     <packaging>jar</packaging>
 
     <name>Redis-like Cache</name>
