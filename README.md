@@ -5,10 +5,12 @@ A lightweight, high-performance Redis-like in-memory cache library for Java. Zer
 ## Features
 
 - **Multiple Data Structures**: Strings, Lists, Sets, Sorted Sets, Hashes
-- **TTL Support**: Automatic expiration with configurable cleanup intervals
-- **Thread-Safe**: All operations are concurrent-safe using `ConcurrentHashMap`
-- **Zero Dependencies**: Single JAR with no external requirements
-- **Statistics**: Built-in hit/miss tracking and cache metrics
+- **Universal TTL Support**: Automatic expiration on any key across all data structures with configurable cleanup intervals
+- **True Thread-Safety**: Concurrency-safe collections, synchronized list mutations, and ReadWriteLock-protected Sorted Sets
+- **Real Blocking Queues**: `blpop` and `brpop` with condition-based blocking and timeouts for producer-consumer workflows
+- **Configurable Eviction Policies**: Bound cache capacity with `ALLKEYS_LRU`, `VOLATILE_LRU`, `VOLATILE_TTL`, `ALLKEYS_FIFO`, or `NO_EVICTION`
+- **Zero Dependencies**: Single JAR targeting Java 8+ with no external third-party dependencies
+- **Statistics & Metrics**: Built-in tracking of hit/miss rates, key counts, eviction count, and expiration count
 
 ## Installation
 
@@ -20,20 +22,20 @@ Add the dependency to your `pom.xml`:
 <dependency>
     <groupId>io.github.chandab0</groupId>
     <artifactId>redis-cache</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.2</version>
 </dependency>
 ```
 
 Or with Gradle:
 
 ```groovy
-implementation 'io.github.chandab0:redis-cache:1.0.0'
+implementation 'io.github.chandab0:redis-cache:1.0.2'
 ```
 
 Or with Gradle Kotlin DSL:
 
 ```kotlin
-implementation("io.github.chandab0:redis-cache:1.0.0")
+implementation("io.github.chandab0:redis-cache:1.0.2")
 ```
 
 ### Manual Installation
@@ -44,10 +46,12 @@ Download the JAR from [Maven Central](https://central.sonatype.com/artifact/io.g
 
 ```java
 import com.cache.RedisCache;
+import com.cache.EvictionPolicy;
 
 public class Example {
     public static void main(String[] args) {
-        RedisCache cache = new RedisCache();
+        // Create an unbounded cache or a bounded cache with eviction policy
+        RedisCache cache = new RedisCache(10000, EvictionPolicy.ALLKEYS_LRU);
 
         // String operations
         cache.set("user:1001", "John Doe");
@@ -56,9 +60,12 @@ public class Example {
         String user = cache.get("user:1001");
         System.out.println(user); // "John Doe"
 
-        // List operations
+        // Universal TTL on any data structure
         cache.rpush("tasks", "task1", "task2", "task3");
-        String task = cache.lpop("tasks");
+        cache.expire("tasks", 300); // Expire list in 5 minutes
+
+        // Blocking pop operations
+        String task = cache.blpop("tasks", 5); // Wait up to 5s if empty
 
         // Set operations
         cache.sadd("tags", "java", "cache", "redis");
@@ -84,6 +91,22 @@ public class Example {
 }
 ```
 
+## Eviction Policies & Max Capacity
+
+You can bound the cache memory by setting a maximum key capacity and an eviction policy:
+
+```java
+// Bounded cache with 10,000 keys max and LRU eviction
+RedisCache cache = new RedisCache(10000, EvictionPolicy.ALLKEYS_LRU);
+```
+
+Supported policies:
+- `NO_EVICTION`: Throws `IllegalStateException` when full.
+- `ALLKEYS_LRU`: Evicts the least recently used keys among all keys.
+- `VOLATILE_LRU`: Evicts the least recently used keys only among keys with an active TTL.
+- `VOLATILE_TTL`: Evicts keys with the shortest time-to-live remaining.
+- `ALLKEYS_FIFO`: Evicts the oldest created keys (First-In, First-Out).
+
 ## API Reference
 
 ### String Operations
@@ -93,9 +116,12 @@ public class Example {
 | `set(key, value)` | Set a string value |
 | `set(key, value, ttlMillis)` | Set with TTL in milliseconds |
 | `setnx(key, value)` | Set if not exists |
+| `setnx(key, value, ttlMillis)` | Set if not exists with TTL |
+| `setxx(key, value)` | Set only if exists |
 | `get(key)` | Get value by key |
 | `get(key, defaultValue)` | Get or return default |
 | `getOrCompute(key, loader)` | Get or compute if missing |
+| `getOrCompute(key, loader, ttlMillis)` | Get or compute with TTL |
 | `getDel(key)` | Get and delete |
 | `getSet(key, newValue)` | Set new and return old |
 | `mset(map)` | Set multiple keys |
@@ -103,21 +129,23 @@ public class Example {
 | `incr(key)` | Increment by 1 |
 | `incrBy(key, delta)` | Increment by delta |
 | `decr(key)` | Decrement by 1 |
+| `decrBy(key, delta)` | Decrement by delta |
 | `append(key, value)` | Append to string |
+| `getRange(key, start, end)` | Get substring |
 | `strlen(key)` | Get string length |
 
-### Key Operations
+### Key Operations (Universal across all types)
 
 | Method | Description |
 |--------|-------------|
-| `del(keys...)` | Delete keys |
-| `exists(key)` | Check if key exists |
-| `expire(key, seconds)` | Set TTL in seconds |
-| `pexpire(key, millis)` | Set TTL in milliseconds |
+| `del(keys...)` | Delete keys across any data type |
+| `exists(key)` | Check if key exists in any data type |
+| `expire(key, seconds)` | Set TTL in seconds on any key |
+| `pexpire(key, millis)` | Set TTL in milliseconds on any key |
 | `ttl(key)` | Get remaining TTL (seconds) |
 | `pttl(key)` | Get remaining TTL (milliseconds) |
 | `persist(key)` | Remove TTL |
-| `keys(pattern)` | Find keys matching pattern |
+| `keys(pattern)` | Find keys matching glob pattern |
 | `rename(oldKey, newKey)` | Rename a key |
 
 ### List Operations
@@ -126,15 +154,19 @@ public class Example {
 |--------|-------------|
 | `lpush(key, values...)` | Push to head |
 | `rpush(key, values...)` | Push to tail |
+| `lpushx(key, value)` | Push to head only if list exists |
+| `rpushx(key, value)` | Push to tail only if list exists |
 | `lpop(key)` | Pop from head |
 | `rpop(key)` | Pop from tail |
+| `blpop(key, timeoutSeconds)` | Blocking pop from head with timeout |
+| `brpop(key, timeoutSeconds)` | Blocking pop from tail with timeout |
 | `llen(key)` | Get list length |
 | `lrange(key, start, stop)` | Get range of elements |
 | `lindex(key, index)` | Get element by index |
 | `ltrim(key, start, stop)` | Trim to range |
 | `lset(key, index, value)` | Set element at index |
 | `lrem(key, count, value)` | Remove elements |
-| `rpoplpush(src, dest)` | Pop and push |
+| `rpoplpush(src, dest)` | Pop from tail and push to head |
 
 ### Set Operations
 
@@ -166,7 +198,8 @@ public class Example {
 | `hkeys(key)` | Get all fields |
 | `hvals(key)` | Get all values |
 | `hlen(key)` | Get field count |
-| `hincrBy(key, field, delta)` | Increment field |
+| `hincrBy(key, field, delta)` | Atomic increment field |
+| `hincrByFloat(key, field, delta)` | Atomic increment float field |
 | `hsetnx(key, field, value)` | Set if not exists |
 
 ### Sorted Set Operations
@@ -185,15 +218,16 @@ public class Example {
 | `zrevrange(key, start, stop)` | Get range (descending) |
 | `zrangeWithScores(key, start, stop)` | Get range with scores |
 | `zcount(key, min, max)` | Count in score range |
+| `zremrangebyrank(key, start, stop)` | Remove range by rank |
 
 ### Utility Operations
 
 | Method | Description |
 |--------|-------------|
-| `info()` | Get cache statistics |
-| `resetStats()` | Reset hit/miss counters |
+| `info()` | Get cache statistics and metrics |
+| `resetStats()` | Reset hit/miss counters and eviction counters |
 | `flushall()` | Clear all data |
-| `shutdown()` | Release resources |
+| `shutdown()` | Release resources and background cleanup threads |
 
 ## Building
 
@@ -208,31 +242,13 @@ mvn clean package
 # Run tests
 mvn test
 
-# Output: target/redis-cache-1.0.0.jar
-```
-
-## Pattern Matching
-
-The `keys(pattern)` method supports Redis-style glob patterns:
-
-- `*` - matches any sequence of characters
-- `?` - matches a single character
-
-```java
-cache.set("user:1", "John");
-cache.set("user:2", "Jane");
-cache.set("session:1", "abc");
-
-Set<String> userKeys = cache.keys("user:*"); // ["user:1", "user:2"]
-Set<String> allKeys = cache.keys("*");       // all keys
+# Output: target/redis-cache-1.0.2.jar
 ```
 
 ## Statistics
 
 ```java
-RedisCache cache = new RedisCache();
-
-// ... perform operations ...
+RedisCache cache = new RedisCache(1000, EvictionPolicy.ALLKEYS_LRU);
 
 Map<String, Object> stats = cache.info();
 // {
@@ -241,24 +257,32 @@ Map<String, Object> stats = cache.info();
 //   "set_keys": 1,
 //   "hash_keys": 3,
 //   "sorted_set_keys": 1,
+//   "total_keys": 12,
 //   "hit_count": 150,
 //   "miss_count": 25,
-//   "hit_ratio": 0.857
+//   "hit_ratio": 0.857,
+//   "max_capacity": 1000,
+//   "eviction_policy": "ALLKEYS_LRU",
+//   "evicted_keys": 0,
+//   "expired_keys": 4
 // }
 ```
 
 ## Thread Safety
 
-All data structures use `ConcurrentHashMap` and thread-safe collections. Multiple threads can safely read and write simultaneously.
+All data structures guarantee full thread-safety:
+- Concurrently modified lists are guarded by fine-grained per-list monitors to prevent `ConcurrentModificationException`.
+- Sorted sets are backed by thread-safe `ReentrantReadWriteLock` mechanics.
+- Hash counters are updated atomically with `Map.compute()`.
 
 ```java
 ExecutorService executor = Executors.newFixedThreadPool(10);
 
-// Safe concurrent access
 for (int i = 0; i < 1000; i++) {
     executor.submit(() -> {
         cache.incr("counter");
-        cache.set("key", "value");
+        cache.rpush("queue", "item");
+        cache.zadd("scores", 10.0, "user");
     });
 }
 ```
