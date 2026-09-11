@@ -8,6 +8,8 @@ A lightweight, high-performance Redis-like in-memory cache library for Java. Zer
 - **Universal TTL Support**: Automatic expiration on any key across all data structures with configurable cleanup intervals
 - **True Thread-Safety**: Concurrency-safe collections, synchronized list mutations, and ReadWriteLock-protected Sorted Sets
 - **Real Blocking Queues**: `blpop` and `brpop` with condition-based blocking and timeouts for producer-consumer workflows
+- **Distributed Locks & Redlock**: Lease-based locks with automatic watchdog heartbeat renewal, safe owner token validation, re-entrancy, and multi-node Redlock consensus
+- **Distributed Rate Limiting & Token Bucket**: Sliding window log (zero boundary-bursts) and continuous token bucket rate limiters with atomic execution
 - **Configurable Eviction Policies**: Bound cache capacity with `ALLKEYS_LRU`, `VOLATILE_LRU`, `VOLATILE_TTL`, `ALLKEYS_FIFO`, or `NO_EVICTION`
 - **Zero Dependencies**: Single JAR targeting Java 8+ with no external third-party dependencies
 - **Statistics & Metrics**: Built-in tracking of hit/miss rates, key counts, eviction count, and expiration count
@@ -22,20 +24,20 @@ Add the dependency to your `pom.xml`:
 <dependency>
     <groupId>io.github.chandab0</groupId>
     <artifactId>redis-cache</artifactId>
-    <version>1.0.2</version>
+    <version>1.0.3</version>
 </dependency>
 ```
 
 Or with Gradle:
 
 ```groovy
-implementation 'io.github.chandab0:redis-cache:1.0.2'
+implementation 'io.github.chandab0:redis-cache:1.0.3'
 ```
 
 Or with Gradle Kotlin DSL:
 
 ```kotlin
-implementation("io.github.chandab0:redis-cache:1.0.2")
+implementation("io.github.chandab0:redis-cache:1.0.3")
 ```
 
 ### Manual Installation
@@ -81,6 +83,28 @@ public class Example {
         cache.zadd("leaderboard", 250, "player2");
         cache.zadd("leaderboard", 175, "player3");
         List<String> topPlayers = cache.zrevrange("leaderboard", 0, 2);
+
+        // Distributed Lock with automatic Watchdog heartbeat renewal
+        com.cache.lock.DistributedLock lock = cache.getLock("order:1001");
+        if (lock.tryLock(3, java.util.concurrent.TimeUnit.SECONDS)) {
+            try {
+                // Critical section protected by lock
+                System.out.println("Acquired lock with watchdog renewal");
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        // Distributed Rate Limiting (Sliding Window & Token Bucket)
+        com.cache.ratelimit.RateLimiter slidingLimiter = cache.getSlidingWindowRateLimiter("api:search", 100, 1, java.util.concurrent.TimeUnit.MINUTES);
+        if (slidingLimiter.tryAcquire()) {
+            System.out.println("Request allowed under 100 req/min limit");
+        }
+
+        com.cache.ratelimit.RateLimiter tokenBucket = cache.getTokenBucketRateLimiter("api:uploads", 10, 2.0); // 10 burst capacity, 2 tokens/sec
+        if (tokenBucket.tryAcquire()) {
+            System.out.println("Permit granted by token bucket");
+        }
 
         // Get cache stats
         Map<String, Object> stats = cache.info();
@@ -219,6 +243,42 @@ Supported policies:
 | `zrangeWithScores(key, start, stop)` | Get range with scores |
 | `zcount(key, min, max)` | Count in score range |
 | `zremrangebyrank(key, start, stop)` | Remove range by rank |
+| `zremrangebyscore(key, min, max)` | Remove range by score |
+
+### Rate Limiter Operations
+
+| Method | Description |
+|--------|-------------|
+| `getSlidingWindowRateLimiter(name, max, dur, unit)` | Create sliding window log rate limiter |
+| `getTokenBucketRateLimiter(name, cap, refillRate)` | Create token bucket rate limiter with burst capacity |
+| `limiter.tryAcquire()` | Attempt immediate acquisition of 1 permit |
+| `limiter.tryAcquire(permits)` | Attempt immediate acquisition of multiple permits |
+| `limiter.tryAcquire(timeout, unit)` | Attempt acquisition waiting up to timeout |
+| `limiter.tryAcquire(permits, timeout, unit)` | Attempt multi-permit acquisition waiting up to timeout |
+| `limiter.acquire()` | Acquire 1 permit, blocking until available |
+| `limiter.acquire(permits)` | Acquire multiple permits, blocking until available |
+| `limiter.getAvailablePermits()` | Query current available permits / tokens |
+| `limiter.reset()` | Reset rate limiter state |
+| `executeAtomic(key, action)` | Execute multi-step operations atomically (Lua script equivalent) |
+
+### Distributed Lock Operations
+
+| Method | Description |
+|--------|-------------|
+| `getLock(lockName)` | Create distributed lock with default 30s watchdog renewal |
+| `getLock(lockName, watchdogTimeoutMs)` | Create distributed lock with custom watchdog renewal |
+| `getRedlock(lockName, otherCaches...)` | Create multi-instance Redlock across instances |
+| `lock.lock()` | Acquire lock (blocking) with watchdog auto-renewal |
+| `lock.lock(leaseTime, unit)` | Acquire lock with explicit lease time (watchdog disabled) |
+| `lock.tryLock()` | Attempt immediate lock acquisition |
+| `lock.tryLock(waitTime, unit)` | Attempt lock acquisition waiting up to `waitTime` |
+| `lock.tryLock(waitTime, leaseTime, unit)` | Attempt lock with custom wait and lease timeout |
+| `lock.unlock()` | Safely release lock (validating owner token) |
+| `lock.isLocked()` | Check if lock is currently held |
+| `lock.isHeldByCurrentThread()` | Check if lock is held by calling thread |
+| `lock.getHoldCount()` | Get re-entrant hold count |
+| `compareAndDelete(key, token)` | Atomic CAS delete for safe lock release |
+| `compareAndExpire(key, token, ms)` | Atomic CAS TTL renewal for watchdog heartbeat |
 
 ### Utility Operations
 
@@ -242,7 +302,7 @@ mvn clean package
 # Run tests
 mvn test
 
-# Output: target/redis-cache-1.0.2.jar
+# Output: target/redis-cache-1.0.3.jar
 ```
 
 ## Statistics

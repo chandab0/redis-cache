@@ -5,6 +5,12 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
+import com.cache.lock.DistributedLock;
+import com.cache.lock.RedisLock;
+import com.cache.lock.Redlock;
+import com.cache.ratelimit.RateLimiter;
+import com.cache.ratelimit.SlidingWindowRateLimiter;
+import com.cache.ratelimit.TokenBucketRateLimiter;
 
 /**
  * Redis-like in-memory cache with support for multiple data structures,
@@ -21,7 +27,7 @@ import java.util.function.Function;
  * </ul>
  *
  * @author Biswajit Chanda
- * @version 1.0.2
+ * @version 1.0.3
  */
 public class RedisCache {
     private final CacheStore stringStore;
@@ -544,6 +550,129 @@ public class RedisCache {
         stringStore.persist(key);
         return removed;
     }
+
+    /**
+     * Atomically deletes a key only if its current value equals expectedValue.
+     * Useful for safe distributed lock release (fencing token verification).
+     *
+     * @param key cache key
+     * @param expectedValue expected current value (e.g. lock owner token)
+     * @return true if deleted, false if key did not exist or value did not match
+     */
+    public synchronized boolean compareAndDelete(String key, Object expectedValue) {
+        if (checkExpired(key)) {
+            return false;
+        }
+        Object current = stringStore.get(key);
+        if (current != null && Objects.equals(current, expectedValue)) {
+            delInternal(key);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Atomically updates the expiration time on a key only if its current value equals expectedValue.
+     * Useful for distributed lock watchdog / heartbeat renewal.
+     *
+     * @param key cache key
+     * @param expectedValue expected current value (e.g. lock owner token)
+     * @param ttlMillis new TTL in milliseconds
+     * @return true if TTL was renewed, false if key did not exist or value did not match
+     */
+    public synchronized boolean compareAndExpire(String key, Object expectedValue, long ttlMillis) {
+        if (checkExpired(key)) {
+            return false;
+        }
+        Object current = stringStore.get(key);
+        if (current != null && Objects.equals(current, expectedValue)) {
+            long expireAt = System.currentTimeMillis() + ttlMillis;
+            keyExpirations.put(key, expireAt);
+            stringStore.expire(key, ttlMillis);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Creates or retrieves a distributed lock for the given lock name with default 30-second watchdog.
+     *
+     * @param lockName name of the lock
+     * @return DistributedLock instance
+     */
+    public DistributedLock getLock(String lockName) {
+        return new RedisLock(this, lockName);
+    }
+
+    /**
+     * Creates or retrieves a distributed lock with custom watchdog timeout.
+     *
+     * @param lockName name of the lock
+     * @param watchdogTimeoutMillis watchdog timeout in milliseconds
+     * @return DistributedLock instance
+     */
+    public DistributedLock getLock(String lockName, long watchdogTimeoutMillis) {
+        return new RedisLock(this, lockName, watchdogTimeoutMillis);
+    }
+
+    /**
+     * Creates a multi-instance Redlock distributed lock across this cache and other caches.
+     *
+     * @param lockName name of the lock
+     * @param otherCaches other RedisCache instances to participate in the quorum
+     * @return Redlock instance
+     */
+    public DistributedLock getRedlock(String lockName, RedisCache... otherCaches) {
+        List<RedisCache> all = new ArrayList<>();
+        all.add(this);
+        if (otherCaches != null) {
+            Collections.addAll(all, otherCaches);
+        }
+        return new Redlock(lockName, all);
+    }
+
+    /**
+     * Executes a function atomically with exclusive synchronization on the specified key.
+     * Provides embedded atomic transaction capabilities analogous to Redis Lua scripts (EVAL).
+     *
+     * @param key cache key to synchronize on
+     * @param action function receiving this cache instance and returning a result
+     * @param <T> result type
+     * @return result returned by the action
+     */
+    public <T> T executeAtomic(String key, Function<RedisCache, T> action) {
+        Object lock = getListLock("atomic:" + key);
+        synchronized (lock) {
+            return action.apply(this);
+        }
+    }
+
+    /**
+     * Creates or retrieves a sliding window log rate limiter for the specified resource.
+     *
+     * @param name unique resource name
+     * @param maxPermits maximum permits allowed within the window
+     * @param windowDuration length of the window
+     * @param unit time unit of window duration
+     * @return RateLimiter instance
+     */
+    public RateLimiter getSlidingWindowRateLimiter(String name, long maxPermits, long windowDuration, TimeUnit unit) {
+        return new SlidingWindowRateLimiter(this, name, maxPermits, windowDuration, unit);
+    }
+
+    /**
+     * Creates or retrieves a token bucket rate limiter for the specified resource.
+     *
+     * @param name unique resource name
+     * @param capacity maximum token capacity (burst limit)
+     * @param refillRatePerSecond number of tokens added per second
+     * @return RateLimiter instance
+     */
+    public RateLimiter getTokenBucketRateLimiter(String name, long capacity, double refillRatePerSecond) {
+        return new TokenBucketRateLimiter(this, name, capacity, refillRatePerSecond);
+    }
+
+
 
     /**
      * Finds all keys matching pattern.
@@ -1455,6 +1584,23 @@ public class RedisCache {
         return zrem(key, toRemove.toArray(new String[0]));
     }
 
+    /**
+     * Removes all members with scores between min and max inclusive (ZREMRANGEBYSCORE).
+     *
+     * @param key sorted set key
+     * @param min minimum score (inclusive)
+     * @param max maximum score (inclusive)
+     * @return number of members removed
+     */
+    public long zremrangebyscore(String key, double min, double max) {
+        checkExpired(key);
+        SortedSetContainer zset = sortedSets.get(key);
+        if (zset == null) return 0;
+        recordAccess(key);
+        return zset.remRangeByScore(min, max);
+    }
+
+
     // ==================== UTILITY & METRICS METHODS ====================
 
     /**
@@ -1723,6 +1869,28 @@ public class RedisCache {
                 return c;
             } finally {
                 rwLock.readLock().unlock();
+            }
+        }
+
+        long remRangeByScore(double min, double max) {
+            rwLock.writeLock().lock();
+            try {
+                long removed = 0;
+                Iterator<Map.Entry<Double, Set<String>>> it = scoreToMembers.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry<Double, Set<String>> entry = it.next();
+                    double score = entry.getKey();
+                    if (score >= min && score <= max) {
+                        for (String m : entry.getValue()) {
+                            memberToScores.remove(m);
+                            removed++;
+                        }
+                        it.remove();
+                    }
+                }
+                return removed;
+            } finally {
+                rwLock.writeLock().unlock();
             }
         }
     }
